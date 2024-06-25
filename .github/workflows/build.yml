@@ -1,0 +1,131 @@
+name: Build Latest
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  
+  workflow_dispatch:
+    inputs:
+      doRelease:
+        description: 'Publish new release'
+        type: boolean
+        default: false
+        required: false
+      tag:
+        type: string
+        description: 'Release version tag (e.g. v1.2.3)'
+        required: true
+        default: 'v0.2.0'
+      ref:
+        type: string
+        description: 'Git ref from which to release'
+        required: true
+        default: 'main'
+
+env:
+  DOTNET_SDK_VERSION: "8.0.*"
+
+jobs:
+  build-win-x64:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@main
+
+      - name: Set up dotnet
+        uses: actions/setup-dotnet@main
+        with:
+          dotnet-version: ${{ env.DOTNET_SDK_VERSION }}
+
+      - run: dotnet publish src/N_m3u8DL-RE -r win-x64 -c Release -o artifact-x64
+      
+      - name: Upload Artifact[win-x64]
+        uses: actions/upload-artifact@main
+        with:
+          name: N_m3u8DL-RE_Beta_win-x64
+          path: artifact-x64\N_m3u8DL-RE.exe
+
+  build-linux-x64:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@main
+      
+      - name: Set up dotnet
+        uses: actions/setup-dotnet@main
+        with:
+          dotnet-version: ${{ env.DOTNET_SDK_VERSION }}
+            
+      - run: dotnet publish src/N_m3u8DL-RE -r linux-x64 -c Release -o artifact-x64
+
+      - name: Upload Artifact[linux-x64]
+        uses: actions/upload-artifact@main
+        with:
+          name: N_m3u8DL-RE_Beta_linux-x64
+          path: artifact-x64/N_m3u8DL-RE
+
+  create_draft_release:
+    name: Create Github draft release
+    if: ${{ github.event.inputs.doRelease == 'true' }}
+    needs: [build-win-x64,build-linux-x64]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: GH version
+        run: gh --version
+
+      - name: Check for existing release
+        id: check_release
+        run: |
+          echo "::echo::on"
+          gh release view --repo '${{ github.repository }}' '${{ github.event.inputs.tag }}' \
+            && echo "already_exists=true" >> $GITHUB_ENV \
+            || echo "already_exists=false" >> $GITHUB_ENV
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout repo
+        if: env.already_exists == 'false'
+        uses: actions/checkout@main
+        with:
+          ref: '${{ github.event.inputs.ref }}'
+
+      - name: Create release
+        if: env.already_exists == 'false'
+        run: >
+          gh release create
+          '${{ github.event.inputs.tag }}'
+          --draft
+          --repo '${{ github.repository }}'
+          --title '${{ github.event.inputs.tag }}'
+          --target '${{ github.event.inputs.ref }}'
+          --generate-notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  attach_to_release:
+    name: Attach native executables to release
+    if: ${{ github.event.inputs.doRelease == 'true' }}
+    needs: create_draft_release
+    runs-on: ubuntu-24.04
+    steps:        
+      - name: GH version
+        run: gh --version
+      
+      - name: Fetch executables
+        uses: actions/download-artifact@main
+
+      - name: Tar (linux)
+        run: for dir in *linux*; do tar cvzfp "${dir}.tar.gz" "$dir"; done
+        
+      - name: Zip (windows)
+        run: for dir in *win*; do zip -r "${dir}.zip" "$dir"; done
+
+      - name: Upload
+        run: |
+          until gh release upload --clobber --repo ${{ github.repository }} ${{ github.event.inputs.tag }} *.zip *.tar.gz; do
+            echo "Attempt $((++attempts)) to upload release artifacts failed. Will retry in 20s"
+            sleep 20
+          done
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
